@@ -7,6 +7,7 @@
 #include <list>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -67,6 +68,36 @@ Vector cross(const Vector& a, const Vector& b) {
     return Vector(a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]);
 }
 
+const Vector g = Vector(0., -0.8, 0.);
+
+class Edge {
+    public:
+        explicit Edge(Vector u, Vector v){
+            edge = std::pair<Vector, Vector>{u, v};
+            N = Vector(v[1] - u[1], u[0] - v[0], 0);
+        }
+
+        Vector intersect(Vector A, Vector B){
+            Vector u = edge.first;
+            Vector v = edge.second;
+            double t = (dot(u - A, N) / dot(B - A, N));
+            if (t < 0 || t > 1){
+                throw std::runtime_error("No intersection exists!");
+            }
+            Vector P = A + t * (B - A);
+            return P;
+        }
+
+        bool is_inside(Vector P){
+            if (dot(P - edge.first, N) <= 0) return true;
+            return false;
+        }
+
+    std::pair<Vector, Vector> edge;
+    Vector N;
+};
+
+
 // if the Polygon class name conflicts with a class in wingdi.h on Windows, use a namespace or change the name
 class Polygon {  
 public:
@@ -81,7 +112,8 @@ public:
         vertices.push_back(vertex);
     }
 
-    double compute_area(){
+    double compute_signed_area(){
+        if (vertices.size() <= 2) return 0.;
         double area = 0;
         int n = vertices.size();
         for (int i = 0; i < n; i++){
@@ -89,11 +121,65 @@ public:
             area += vertices[i][0] * vertices[j][1];
             area -= vertices[j][0] * vertices[i][1];
         } 
-        return std::abs(area) / 2.0;
+        return area / 2.0;
     }
 
+    double compute_area(){
+        return std::abs(compute_signed_area());
+    }
+
+    Vector compute_centroid(){
+        double signed_area = compute_signed_area();
+        double centroid_x, centroid_y;
+        int n = vertices.size();
+        for (int i = 0; i < n; i++){
+            int j = (i + 1) % n;
+            centroid_x += (vertices[i][0] + vertices[j][0]) * (vertices[i][0] * vertices[j][1] - vertices[j][0] * vertices[i][1]);
+            centroid_y += (vertices[i][1] + vertices[j][1]) * (vertices[i][0] * vertices[j][1] - vertices[j][0] * vertices[i][1]);
+        }
+        centroid_x = (1. / (6. * signed_area)) * centroid_x;
+        centroid_y = (1. / (6. * signed_area)) * centroid_y;
+        return Vector(centroid_x, centroid_y, 0.);
+    }
+
+    void compute_edges(){
+        int n = vertices.size(); 
+        for (int i = 0; i < n - 2; i++){
+            edges.push_back(Edge(vertices[i], vertices[i + 1]));
+        }
+        edges.push_back(Edge(vertices[n - 1], vertices[0]));
+    }
+
+    std::vector<Edge> edges;
     std::vector<Vector> vertices;
 };  
+
+Polygon clipByPolygon(Polygon& subjectPolygon, Polygon& clipPolygon){
+    int n = subjectPolygon.vertices.size();
+    int m = clipPolygon.vertices.size();
+    clipPolygon.compute_edges();
+    for (auto& clipEdge: clipPolygon.edges){
+        Polygon* outPolygon = new Polygon();
+        for (int j = 0; j < n; j++){
+            Vector curVertex = subjectPolygon.vertices[j];
+            int k = n - 1;
+            if (j > 0) k = j - 1;
+            Vector prevVertex = subjectPolygon.vertices[k];
+            Vector intersection = clipEdge.intersect(prevVertex, curVertex);
+            if (clipEdge.is_inside(curVertex)){
+                if (! clipEdge.is_inside(prevVertex)){
+                    outPolygon->add_vertex(intersection);
+                }
+                outPolygon->add_vertex(curVertex);
+            }
+            else if (clipEdge.is_inside(prevVertex)){
+                outPolygon->add_vertex(intersection);
+            }
+        }
+        subjectPolygon = *outPolygon;
+    }
+    return subjectPolygon;
+}
 
 Polygon clipByBisector(Polygon& polygon, Vector& P_i, Vector& P_j, double w_i, double w_j){
     // the code implements the Sutherland-Hodgman algorithm as presented in the lecture notes
@@ -122,11 +208,20 @@ Polygon clipByBisector(Polygon& polygon, Vector& P_i, Vector& P_j, double w_i, d
             }
             new_cell.add_vertex(B);
         }
-        else if (((A - P_i).norm2() - w_i) <= ((A - P_j).norm2() - w_j)){
+        else if (((A - P_i).norm2() - w_i) <= ((A - P_j).norm2() - w_j)){ //inside
             new_cell.add_vertex(P);
         }
     }
     return new_cell;
+}
+
+Polygon create_disk(Vector& center, double radius, int num_points = 30){
+    std::vector<Vector> vertices_disk(num_points);
+    for (int i = 0; i < num_points; i++){
+        Vector vertex(std::cos(2 * M_PI * i / num_points), std::sin(2 * M_PI * i / num_points), 0.);
+        vertices_disk[i] = center + radius * vertex;
+    }
+    return Polygon(vertices_disk);
 }
 
 class Voronoi{
@@ -172,6 +267,63 @@ public:
     std::vector<double> lambdas;
 };
 
+class VoronoiFluid{
+public:
+    VoronoiFluid(std::vector<Vector> particles, std::vector<double> weights, std::vector<double> lambdas, double desired_fluid_volume){
+        this->particles = particles;
+        int n = particles.size();
+        weight_air = weights[n];
+        weights.pop_back();
+        weights_fluids = weights;
+        lambda_air = lambdas[n];
+        lambdas.pop_back();
+        lambdas_fluids = lambdas;
+        this->desired_fluid_volume = desired_fluid_volume;
+    }
+
+    void add_particle(Vector particle){
+        particles.push_back(particle);
+    }
+
+    void compute_voronoi_fluids(){
+        Polygon square;
+        square.add_vertex(Vector(0, 0, 0));
+        square.add_vertex(Vector(1, 0, 0));
+        square.add_vertex(Vector(1, 1, 0));
+        square.add_vertex(Vector(0, 1, 0));
+        int n = particles.size();
+        cells.resize(n);
+        for (int i = 0; i < n; i++){
+            Polygon cell = square;
+            Vector curPoint = particles[i];
+            double curWeight = weights_fluids[i];
+            for (int j = 0; j < n; j++){
+                if (i == j) continue;
+                Vector nextPoint = particles[j];
+                double nextWeight = weights_fluids[j];
+                cell = clipByBisector(cell, curPoint, nextPoint, curWeight, nextWeight);
+            }
+            if (weights_fluids[i] <= weight_air){
+                cells[i] = Polygon();
+            }
+            else{
+                double R = std::sqrt(weights_fluids[i] - weight_air);
+                Polygon clippind_disk = create_disk(curPoint, R);
+                cell = clipByPolygon(cell, clippind_disk);
+                cells[i] = cell;
+            }   
+        }
+    }
+
+    std::vector<Vector> particles;
+    std::vector<Polygon> cells;
+    std::vector<double> weights_fluids;
+    std::vector<double> lambdas_fluids;
+    double weight_air;
+    double lambda_air;
+    double desired_fluid_volume;
+};
+
 // for the evaluate fuunction I collaborated with my colleague Cezara Petrui
 // since both of us were running into convergence issues initially
 static lbfgsfloatval_t evaluate(void *instance, const lbfgsfloatval_t *x, lbfgsfloatval_t *g, const int n, const lbfgsfloatval_t step){
@@ -196,13 +348,48 @@ static lbfgsfloatval_t evaluate(void *instance, const lbfgsfloatval_t *x, lbfgsf
             double Y_k = cell.vertices[k][1];
             t1 = t1 + ((X_j * Y_k - X_k * Y_j) * (std::pow(X_j, 2) + X_j * X_k + std::pow(X_k, 2) + std::pow(Y_j, 2) + Y_j * Y_k + std::pow(Y_k, 2) - 4 * (voronoi->points[i][0] * (X_j + X_k) + voronoi->points[i][1] * (Y_j + Y_k)) + 6 * voronoi->points[i].norm2()));
         }
-        t1 /= 12;
+        t1 /= 12.;
         double t2 = -x[i] * cell.compute_area();
         double t3 = x[i] * voronoi->lambdas[i];
         fx += t1 + t2 + t3;
         g[i] = - voronoi->lambdas[i] + cell.compute_area(); // megative gradient
     }
     return -fx; // negative funtion for maximizing
+}
+
+static lbfgsfloatval_t evaluate_fluid(void *instance, const lbfgsfloatval_t *x, lbfgsfloatval_t *g, const int n, const lbfgsfloatval_t step){
+    VoronoiFluid *vor_fluid = static_cast<VoronoiFluid*>(instance);
+    lbfgsfloatval_t fx = 0.0;
+    for (int i = 0; i < n - 1; i++){
+        vor_fluid->weights_fluids[i] = x[i];
+    }
+    vor_fluid->weight_air = x[n - 1];
+    vor_fluid->compute_voronoi_fluids();
+    double total_area = 0.0;
+    for (int i = 0; i < n - 1; i++){
+        Polygon cell = vor_fluid->cells[i];
+        double t1 = 0;
+        for (int j = 0; j < cell.vertices.size(); j++){
+            int k = (j + 1) % (cell.vertices.size());
+            double X_j = cell.vertices[j][0];
+            double Y_j = cell.vertices[j][1];
+            double X_k = cell.vertices[k][0];
+            double Y_k = cell.vertices[k][1];
+            t1 = t1 + ((X_j * Y_k - X_k * Y_j) * (std::pow(X_j, 2) + X_j * X_k + std::pow(X_k, 2) + std::pow(Y_j, 2) + Y_j * Y_k + std::pow(Y_k, 2) - 4 * (vor_fluid->particles[i][0] * (X_j + X_k) + vor_fluid->particles[i][1] * (Y_j + Y_k)) + 6 * vor_fluid->particles[i].norm2()));
+        }
+        t1 /= 12.;
+        double area = cell.compute_area();
+        total_area += area;
+        double t2 = -x[i] * area;
+        double t3 = vor_fluid->desired_fluid_volume / ((double) n - 1) * x[i];
+        fx += t1 + t2 + t3;
+        g[i] = vor_fluid->desired_fluid_volume / ((double) n - 1) - area;
+    }
+    double desired_air_volume = 1. - vor_fluid->desired_fluid_volume;
+    double estimated_air_volume = 1 - total_area;
+    fx += x[n - 1] * (desired_air_volume - estimated_air_volume);
+    g[n - 1] = desired_air_volume / ((double) n - 1) - estimated_air_volume;
+    return fx; 
 }
 
 static int progress(
@@ -298,7 +485,7 @@ struct Facet {
     std::vector<Vector> vertices;
 };
 
-    void save_frame(const std::vector<Facet> &cells, std::string filename, int frameid = 0) {
+    void save_frame(const std::vector<Polygon> &cells, std::string filename, int frameid = 0) {
         int W = 1000, H = 1000;
         std::vector<unsigned char> image(W*H * 3, 255);
         #pragma omp parallel for schedule(dynamic)
@@ -364,52 +551,138 @@ struct Facet {
         stbi_write_png(os.str().c_str(), W, H, 3, &image[0], 0);
     }
 
-int main(){
-    // the initialization of lbfgs was taken from the lbfgs library provided,
-    // namely from https://github.com/chokkan/liblbfgs/tree/master/sample
-    auto start_code = std::chrono::system_clock::now();
+std::pair<std::vector<Vector>, std::vector<Vector>> gallouet_merigot_scheme(VoronoiFluid vor_fluid, std::vector<Vector> v, std::vector<double> m, double eps = 0.004, double dt = 0.002){
+    int n = vor_fluid.particles.size();
+    vor_fluid.compute_voronoi_fluids();
+    std::vector<Vector>new_positions(n);
+    std::vector<Vector>new_velocities(n);
+    for (int i = 0; i < n; i++){
+        Polygon cell = vor_fluid.cells[i];
+        Vector centroid_cell = cell.compute_centroid();
+        Vector F_spring_particle = (1. / (eps * eps)) * (centroid_cell - vor_fluid.particles[i]);
+        Vector F_particle = F_spring_particle + m[i] * g;
+        Vector new_v_particle = v[i] + dt/m[i] * F_particle;
+        Vector new_position_particle = vor_fluid.particles[i] + dt * v[i];
+        new_positions[i] = new_position_particle;
+        new_velocities[i] = new_v_particle;
+    }
+    return std::pair<std::vector<Vector>, std::vector<Vector>>{new_positions, new_velocities};
+}
+
+void compute_frame(std::vector<Vector> fluid_particles, std::vector<double> weights, std::vector<double> lambdas, double desired_fluid_volume, std::vector<Vector> v, std::vector<double> m, int frameid){
+    int num_particles = fluid_particles.size();
+    VoronoiFluid vor_fluid = VoronoiFluid(fluid_particles, weights, lambdas, desired_fluid_volume);
     int ret = 0;
     lbfgsfloatval_t fx;
-    int num_points = 100;
-    lbfgsfloatval_t *x = lbfgs_malloc(num_points);
+    lbfgsfloatval_t *x = lbfgs_malloc(num_particles + 1);
     lbfgs_parameter_t param;
-    Vector C = Vector(0.5, 0.5, 0);
 
     if (x == NULL) {
         printf("ERROR: Failed to allocate a memory block for variables.\n");
-        return 1;
     }
 
     lbfgs_parameter_init(&param);
 
-    std::vector<Vector> points;
-    std::vector<double> weights;
-    std::vector<double> lambdas;
-    for (int i = 0; i < num_points; i++){
-        double first_coordinate = ((double)rand()) / RAND_MAX;
-        double second_coordinate = ((double)rand()) / RAND_MAX;
-        Vector point(first_coordinate, second_coordinate, 0);
-        points.push_back(point);
-        double weight= ((double)rand()) / RAND_MAX;
-        weights.push_back(weight);
-        x[i] = weight;
-        lambdas.push_back(1. / num_points);
-    }
-    Voronoi vor = Voronoi(points, weights, lambdas);
-
-    ret = lbfgs(num_points, x, &fx, evaluate, progress, static_cast<void*>(&vor), &param);
+    ret = lbfgs(num_particles + 1, x, &fx, evaluate_fluid, progress, static_cast<void*>(&vor_fluid), &param);
 
     printf("L-BFGS optimization terminated with status code = %d\n", ret);
     printf("  fx = %f, x[0] = %f, x[1] = %f\n", fx, x[0], x[1]);
 
-
-    std::cout<<vor.weights[0]<<" "<<vor.weights[1]<<std::endl;
-    vor.compute_voronoi();
-    auto end_code = std::chrono::system_clock::now();
-    std::string filename = "lbfgs_diagram" + std::to_string(num_points) + ".svg";
-    save_svg(vor.cells, filename);
-    std::chrono::duration<double> elapsed_time = end_code - start_code;
     lbfgs_free(x);
-    std::cout<<"Time elapsed for computing the power diagram for "<<num_points<<" points is "<<elapsed_time.count()<<std::endl;
+
+    std::pair<std::vector<Vector>, std::vector<Vector>> outputs = gallouet_merigot_scheme(vor_fluid, v, m);
+    v = outputs.second;
+    fluid_particles = outputs.first;
+    vor_fluid.particles = outputs.first;
+    vor_fluid.compute_voronoi_fluids();
+    std::string filename = "fluids_frame" + std::to_string(frameid) + ".svg";
+    save_frame(vor_fluid.cells, filename, frameid);
+}
+
+int main(){
+    // the initialization of lbfgs was taken from the lbfgs library provided,
+    // namely from https://github.com/chokkan/liblbfgs/tree/master/sample
+    int test_lbfgs = 0; //for testing the power diagram and the LBFGS optimization, make this 1
+    auto start_code = std::chrono::system_clock::now();
+    if (test_lbfgs){
+        int num_points = 100;
+        int ret = 0;
+        lbfgsfloatval_t fx;
+        lbfgsfloatval_t *x = lbfgs_malloc(num_points);
+        lbfgs_parameter_t param;
+
+        if (x == NULL) {
+            printf("ERROR: Failed to allocate a memory block for variables.\n");
+            return 1;
+        }
+
+        lbfgs_parameter_init(&param);
+
+        std::vector<Vector> points;
+        std::vector<double> weights;
+        std::vector<double> lambdas;
+        for (int i = 0; i < num_points; i++){
+            double first_coordinate = ((double)rand()) / RAND_MAX;
+            double second_coordinate = ((double)rand()) / RAND_MAX;
+            Vector point(first_coordinate, second_coordinate, 0);
+            points.push_back(point);
+            double weight= ((double)rand()) / RAND_MAX;
+            weights.push_back(weight);
+            x[i] = weight;
+            lambdas.push_back(1. / num_points);
+        }
+        Voronoi vor = Voronoi(points, weights, lambdas);
+
+        ret = lbfgs(num_points, x, &fx, evaluate, progress, static_cast<void*>(&vor), &param);
+
+        printf("L-BFGS optimization terminated with status code = %d\n", ret);
+        printf("  fx = %f, x[0] = %f, x[1] = %f\n", fx, x[0], x[1]);
+
+
+        std::cout<<vor.weights[0]<<" "<<vor.weights[1]<<std::endl;
+        vor.compute_voronoi();
+        
+        std::string filename = "lbfgs_diagram" + std::to_string(num_points) + ".svg";
+        save_svg(vor.cells, filename);
+        
+        lbfgs_free(x);
+        
+    }
+    else{ // handle the fluids
+        int num_particles = 700;
+        double desired_fluid_volume = 0.25;
+        int num_frames = 10;
+       // int num_fluid_particles = 700;
+        double desired_air_volume = 1 - desired_fluid_volume;
+        std::vector<Vector> fluid_particles(num_particles);
+        std::vector<double> weights(num_particles + 1);
+        std::vector<double> lambdas(num_particles + 1);
+        for (int i = 0; i < num_particles; i++){
+            double first_coordinate_fluid = ((double)rand()) / RAND_MAX;
+            double second_coordinate_fluid = ((double)rand()) / RAND_MAX;
+            Vector fluid_particle(first_coordinate_fluid, second_coordinate_fluid, 0);
+            fluid_particles[i] = fluid_particle;
+            double fluid_weight = ((double)rand()) / RAND_MAX;
+            weights[i] = fluid_weight;
+            lambdas[i] = desired_fluid_volume / num_particles;
+        }
+        //fluid_particles[num_particles] = Vector(((double)rand()) / RAND_MAX, ((double)rand()) / RAND_MAX, 0);
+        weights[num_particles] = ((double)rand()) / RAND_MAX;
+        lambdas[num_particles] = desired_air_volume;
+
+        std::vector<Vector> v(num_particles);
+        std::vector<double> m(num_particles);
+        for (int i = 0; i < num_particles; i++){
+            v[i] = Vector(0., 0., 0.);
+            m[i] = 200.;
+        }
+
+        for (int frame = 0; frame < num_frames; frame++){
+            compute_frame(fluid_particles, weights, lambdas, desired_fluid_volume, v, m, frame);
+        }
+    }
+    auto end_code = std::chrono::system_clock::now();
+    std::chrono::duration<double> elapsed_time = end_code - start_code;
+    //std::cout<<"Time elapsed for computing the power diagram for "<<num_points<<" points is "<<elapsed_time.count()<<std::endl;
     return 0;
 }
